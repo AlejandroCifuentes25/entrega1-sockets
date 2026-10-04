@@ -1,82 +1,124 @@
+"""
+Nodo (agente de monitoreo). Reporta CPU y RAM reales al servidor central.
+
+Uso: python nodo.py [host] [puerto] [id_nodo]
+     por defecto: localhost 8080 NODE_01
+
+Comportamiento ante fallas:
+  - Si falla la resolucion DNS, la conexion o el servidor no responde en
+    TIMEOUT segundos, el nodo NO termina: cierra el socket, espera
+    ESPERA_REINTENTO segundos y vuelve a conectarse y registrarse.
+"""
+import platform
 import socket
 import sys
 import time
+
 import psutil
 
-UMBRAL_CPU = 90.0  # % de CPU para disparar alarma
-UMBRAL_RAM = 90.0  # % de RAM para disparar alarma
-INTERVALO  = 5     # segundos entre cada DATA
+UMBRAL_CPU       = 90.0  # % de CPU que dispara una ALARM
+UMBRAL_RAM       = 90.0  # % de RAM que dispara una ALARM
+INTERVALO        = 5     # segundos entre cada DATA
+TIMEOUT          = 5     # segundos maximos esperando respuesta del servidor
+ESPERA_REINTENTO = 5     # segundos antes de reintentar la conexion
 
-def iniciar_nodo(host, puerto, id_nodo):
-    # Resolver nombre de dominio (sin IPs hardcodeadas)
-    ip_resuelta = socket.gethostbyname(host)
-    
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.connect((ip_resuelta, puerto))
-        print(f"[NODO] Conectado al servidor {host} ({ip_resuelta}:{puerto})")
-    except Exception as e:
-        print(f"[NODO] No se pudo conectar: {e}")
-        sys.exit(1)
 
-    # 1. Registrarse en el servidor
-    reg_msg = f"REG|{id_nodo}|LINUX_SERVER\n"
-    s.sendall(reg_msg.encode())
-    respuesta = s.recv(1024).decode().strip()
-    print(f"[NODO] Registro -> {respuesta}")
+class ErrorProtocolo(Exception):
+    pass
 
-    if "ERROR" in respuesta or "ERR" in respuesta:
-        print("[NODO] El servidor rechazó el registro. Saliendo.")
-        s.close()
-        sys.exit(1)
 
-    print(f"[NODO] Iniciando monitoreo cada {INTERVALO}s (Ctrl+C para detener)...\n")
+def conectar(host, puerto):
+    ip = socket.gethostbyname(host)          # puede lanzar socket.gaierror
+    s = socket.create_connection((ip, puerto), timeout=TIMEOUT)
+    s.settimeout(TIMEOUT)
+    return s, ip
 
-    # 2. Bucle de monitoreo periódico
-    try:
-        while True:
-            # Leer métricas reales con psutil
-            cpu = psutil.cpu_percent(interval=1)       # % uso CPU
-            ram = psutil.virtual_memory().percent      # % uso RAM
 
-            # Enviar telemetría periódica
-            data_msg = f"DATA|{id_nodo}|{cpu}|{ram}\n"
-            s.sendall(data_msg.encode())
-            resp_data = s.recv(1024).decode().strip()
-            print(f"[NODO] CPU:{cpu}% RAM:{ram}% -> {resp_data}")
+def transaccion(s, lector, mensaje):
+    """Envia un mensaje y espera una linea de respuesta (con timeout)."""
+    s.sendall(mensaje.encode("utf-8"))
+    respuesta = lector.readline()
+    if not respuesta:
+        raise ConnectionError("El servidor cerro la conexion")
+    return respuesta.strip()
 
-            # Detectar umbral crítico y enviar ALARM de inmediato
-            if cpu > UMBRAL_CPU:
-                alarm_msg = f"ALARM|{id_nodo}|CPU_OVERLOAD|{cpu}|CPU supera el {UMBRAL_CPU}%\n"
-                s.sendall(alarm_msg.encode())
-                resp_alarm = s.recv(1024).decode().strip()
-                print(f"[NODO] *** ALARMA CPU enviada -> {resp_alarm}")
 
-            if ram > UMBRAL_RAM:
-                alarm_msg = f"ALARM|{id_nodo}|RAM_OVERLOAD|{ram}|RAM supera el {UMBRAL_RAM}%\n"
-                s.sendall(alarm_msg.encode())
-                resp_alarm = s.recv(1024).decode().strip()
-                print(f"[NODO] *** ALARMA RAM enviada -> {resp_alarm}")
+def ejecutar_nodo(host, puerto, id_nodo):
+    tipo = platform.system().upper() or "DESCONOCIDO"
 
-            time.sleep(INTERVALO)
+    while True:
+        s = None
+        try:
+            s, ip = conectar(host, puerto)
+            lector = s.makefile("r", encoding="utf-8", newline="\n")
+            print(f"[NODO] Conectado a {host} ({ip}:{puerto})")
 
-    except KeyboardInterrupt:
-        print("\n[NODO] Detenido por el usuario.")
-    except Exception as e:
-        print(f"[NODO] Error en el bucle: {e}")
-    finally:
-        s.close()
+            # 1. Registro obligatorio
+            resp = transaccion(s, lector, f"REG|{id_nodo}|{tipo}\n")
+            print(f"[NODO] REG -> {resp}")
+            if not resp.startswith("REG_ACK"):
+                raise ErrorProtocolo(f"Registro rechazado: {resp}")
+
+            print(f"[NODO] Monitoreo cada {INTERVALO}s (Ctrl+C para detener)\n")
+            psutil.cpu_percent(interval=None)  # primera lectura de referencia
+
+            # 2. Ciclo de monitoreo
+            while True:
+                cpu = psutil.cpu_percent(interval=1)
+                ram = psutil.virtual_memory().percent
+
+                resp = transaccion(s, lector, f"DATA|{id_nodo}|{cpu:.1f}|{ram:.1f}\n")
+                print(f"[NODO] CPU:{cpu:.1f}% RAM:{ram:.1f}% -> {resp}")
+                if resp.startswith("ERR"):
+                    print(f"[NODO] El servidor reporto un error: {resp}")
+
+                # 3. Eventos criticos: se envian de inmediato
+                if cpu > UMBRAL_CPU:
+                    resp = transaccion(s, lector,
+                        f"ALARM|{id_nodo}|CPU_OVERLOAD|{cpu:.1f}|CPU supera el {UMBRAL_CPU:.0f} por ciento\n")
+                    print(f"[NODO] *** ALARMA CPU -> {resp}")
+                if ram > UMBRAL_RAM:
+                    resp = transaccion(s, lector,
+                        f"ALARM|{id_nodo}|RAM_OVERLOAD|{ram:.1f}|RAM supera el {UMBRAL_RAM:.0f} por ciento\n")
+                    print(f"[NODO] *** ALARMA RAM -> {resp}")
+
+                time.sleep(INTERVALO)
+
+        except KeyboardInterrupt:
+            print("\n[NODO] Detenido por el usuario.")
+            if s:
+                try:
+                    s.sendall(b"BYE|" + id_nodo.encode() + b"\n")
+                except OSError:
+                    pass
+                s.close()
+            return
+        except socket.gaierror as e:
+            print(f"[NODO] No se pudo resolver el nombre '{host}': {e}")
+        except (socket.timeout, TimeoutError):
+            print(f"[NODO] Temporizador expirado: el servidor no respondio en {TIMEOUT}s")
+        except ErrorProtocolo as e:
+            print(f"[NODO] {e}")
+        except (ConnectionError, OSError) as e:
+            print(f"[NODO] Falla de comunicacion: {e}")
+
+        if s:
+            s.close()
+        print(f"[NODO] Reintentando en {ESPERA_REINTENTO}s...\n")
+        try:
+            time.sleep(ESPERA_REINTENTO)
+        except KeyboardInterrupt:
+            print("\n[NODO] Detenido por el usuario.")
+            return
+
 
 if __name__ == "__main__":
-    host_servidor  = 'localhost'
-    puerto_servidor = 8080
-    id_nodo        = 'NODE_01'
+    host_servidor   = sys.argv[1] if len(sys.argv) >= 2 else "localhost"
+    puerto_servidor = int(sys.argv[2]) if len(sys.argv) >= 3 else 8080
+    id_nodo         = sys.argv[3] if len(sys.argv) >= 4 else "NODE_01"
 
-    if len(sys.argv) >= 2:
-        host_servidor = sys.argv[1]
-    if len(sys.argv) >= 3:
-        puerto_servidor = int(sys.argv[2])
-    if len(sys.argv) >= 4:
-        id_nodo = sys.argv[3]
+    if "|" in id_nodo:
+        print("El ID del nodo no puede contener el caracter '|'")
+        sys.exit(1)
 
-    iniciar_nodo(host_servidor, puerto_servidor, id_nodo)
+    ejecutar_nodo(host_servidor, puerto_servidor, id_nodo)
